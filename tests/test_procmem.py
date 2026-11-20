@@ -7,7 +7,7 @@ import struct
 import tempfile
 import pytest
 
-from malduck import procmem, procmempe, procmemdnpe, cuckoomem, pad, pe, insn, PAGE_READWRITE, enhex
+from malduck import procmem, procmempe, procmemdnpe, cuckoomem, pad, pe, insn, PAGE_READWRITE, enhex, Yara
 from malduck.procmem import Region
 
 
@@ -272,3 +272,159 @@ def test_procmemdnpe():
         assert p.pe.dn_metadata.struct.Version == b'v4.0.30319\x00\x00'
         assert p.pe.dn_metadata.struct.NumberOfStreams == len(p.pe.dn_metadata.streams)
         assert p.pe.dn_user_string(1).value == "Hello World!"
+
+
+def test_v2p_p2v_multiregion_contiguous():
+    payload = b"A" * 0x1000 + b"B" * 0x1000
+    regions = [
+        Region(0x400000, 0x1000, 0, 0, 0, 0),
+        Region(0x401000, 0x1000, 0, 0, 0, 0x1000),
+    ]
+    p = procmem(payload, regions=regions)
+    # Range spanning two fully contiguous regions: translation must be
+    # performed using the region containing the starting point
+    assert p.v2p(0x400FF0, 0x20) == 0xFF0
+    assert p.p2v(0xFF0, 0x20) == 0x400FF0
+    assert p.readv(0x400FF0, 0x20) == p.readp(0xFF0, 0x20)
+
+
+def test_v2p_p2v_offset_gap():
+    # VA-contiguous regions with a gap in buffer offsets
+    payload = b"A" * 0x1000 + b"GAP!" + b"B" * 0x1000
+    regions = [
+        Region(0x400000, 0x1000, 0, 0, 0, 0),
+        Region(0x401000, 0x1000, 0, 0, 0, 0x1004),
+    ]
+    p = procmem(payload, regions=regions)
+    # Range crosses the unmapped buffer hole: must fail instead of
+    # returning a plausible-looking translation
+    assert p.v2p(0x400FF0, 0x20) is None
+    assert p.p2v(0xFF0, 0x20) is None
+    # Ranges within a single region still work
+    assert p.v2p(0x400FF0, 0x10) == 0xFF0
+    assert p.p2v(0xFF0, 0x10) == 0x400FF0
+    assert p.v2p(0x401000, 0x10) == 0x1004
+    assert p.p2v(0x1004, 0x10) == 0x401000
+
+
+def test_v2p_p2v_va_gap():
+    # Offset-contiguous regions with a gap in virtual addresses
+    payload = b"A" * 0x1000 + b"B" * 0x1000
+    regions = [
+        Region(0x400000, 0x1000, 0, 0, 0, 0),
+        Region(0x410000, 0x1000, 0, 0, 0, 0x1000),
+    ]
+    p = procmem(payload, regions=regions)
+    assert p.v2p(0x400FF0, 0x20) is None
+    assert p.p2v(0xFF0, 0x20) is None
+    assert p.v2p(0x400FF0, 0x10) == 0xFF0
+    assert p.p2v(0xFF0, 0x10) == 0x400FF0
+
+
+def test_from_memory_base_zero():
+    # Explicitly provided base=0 must not be overridden by source imgbase
+    p = procmem(b"MZ" + b"\x00" * 0x100, base=0x400000)
+    q = procmem.from_memory(p, base=0)
+    assert q.imgbase == 0
+    q = procmem.from_memory(p)
+    assert q.imgbase == 0x400000
+
+
+def test_cuckoomem_truncated():
+    # Region claims more data than available: clamp to actual contents
+    buf = struct.pack("QIIII", 0x401000, 0x1000, 0, 0, PAGE_READWRITE) + b"D" * 0x100
+    p = cuckoomem(buf)
+    assert len(p.regions) == 1
+    assert p.regions[0].size == 0x100
+    assert p.readv(0x401000, 0x200) == b"D" * 0x100
+    # Addresses beyond the truncated region must not be mapped
+    assert p.v2p(0x401100) is None
+    assert p.readv(0x401100, 0x10) == b""
+    # Truncated region header: stop parsing instead of raising
+    buf = struct.pack("QIIII", 0x401000, 0x10, 0, 0, PAGE_READWRITE) + b"D" * 0x10 + b"\xff" * 10
+    p = cuckoomem(buf)
+    assert len(p.regions) == 1
+    assert p.regions[0].size == 0x10
+
+
+def test_procmempe_carved_image_coords():
+    with open("tests/files/calc.exe", "rb") as f:
+        pe_data = f.read()
+    # PE embedded at non-zero offset in a larger dump
+    mem = procmem(b"\xcc" * 0x400 + pe_data, base=0x500000)
+    img = procmempe.from_memory(mem, base=0x500400, image=True)
+    assert img.imgbase == 0x1000000
+    # Regions keep offsets in the coordinate system of the underlying dump
+    assert img.regions[0].offset == 0x400
+    # Dump offset of the embedded PE start maps to the image base
+    assert img.p2v(0x400) == img.imgbase
+    # .text section: raw data at dump offset 0x400 (padding) + 0x400 (PointerToRawData)
+    assert img.v2p(img.imgbase + 0x1000) == 0x800
+    assert img.readv(img.imgbase + 0x1000, 16) == mem.readp(0x800, 16)
+    # Hits located before the embedded PE must not be mapped into the image
+    assert img.p2v(0x10) is None
+    assert img.p2v(0x3FF) is None
+    # ...and addresses of the image view don't leak into the padding
+    assert img.v2p(img.imgbase) == 0x400
+
+
+def test_procmempe_multiple_carved_images():
+    with open("tests/files/calc.exe", "rb") as f:
+        pe_data = f.read()
+    second_pe_off = 0x100 + len(pe_data) + 0x100
+    mem = procmem(
+        b"\xcc" * 0x100 + pe_data + b"\xdd" * 0x100 + pe_data, base=0x500000
+    )
+    img1 = procmempe.from_memory(mem, base=0x500100, image=True)
+    img2 = procmempe.from_memory(mem, base=0x500000 + second_pe_off, image=True)
+    # Each image view maps only its own PE range, all in the same
+    # (dump buffer) offset coordinate system
+    assert img1.p2v(0x100) == img1.imgbase
+    assert img1.p2v(second_pe_off) is None
+    assert img2.p2v(second_pe_off) == img2.imgbase
+    assert img2.p2v(0x100) is None
+    # Same bytes are reachable through both views and the dump itself
+    assert (
+        img1.readv(img1.imgbase + 0x1000, 16)
+        == img2.readv(img2.imgbase + 0x1000, 16)
+        == mem.readp(0x100 + 0x400, 16)
+    )
+
+
+def test_procmempe_carved_image_yara_remap():
+    with open("tests/files/ollydbg.exe", "rb") as f:
+        pe_data = f.read()
+    # Marker in the padding must not be mapped into the carved image
+    mem = procmem(b"MARKER!" + b"\xcc" * (0x2000 - 7) + pe_data, base=0x500000)
+    img = procmempe.from_memory(mem, base=0x502000, image=True)
+    rules = Yara(strings={"marker": "MARKER!", "olly": " - OllyDbg is"})
+    hits = mem.yarap(rules)
+    assert hits.r.marker and hits.r.olly
+    # Remap dump offsets to image VAs, like ExtractManager does
+    remapped = hits.remap(img.p2v)
+    # Hit outside the embedded PE is dropped, not relocated into the image
+    assert "marker" not in remapped.r
+    # Hits inside the PE point at the same bytes in the image view
+    assert remapped.r.olly
+    for va in remapped.r.olly:
+        assert img.readv(va, 13) == b" - OllyDbg is"
+
+
+def test_procmempe_image_truncated():
+    with open("tests/files/calc.exe", "rb") as f:
+        pe_data = f.read()
+    # Truncate inside .text raw data (which starts at 0x400)
+    truncated = pe_data[:0x8100]
+    p = procmempe(truncated, image=True)
+    # All regions must stay within the actual buffer contents
+    assert p.regions
+    for region in p.regions:
+        assert region.offset + region.size <= len(truncated)
+    # .text region is clamped to available data
+    text = p.addr_region(p.imgbase + 0x1000)
+    assert text is not None
+    assert text.offset + text.size == len(truncated)
+    # Section that lies completely beyond the buffer is not mapped
+    assert p.addr_region(p.imgbase + 0x54000) is None
+    # Reads still work within the clamped region
+    assert p.readv(p.imgbase + 0x1000, 16) == truncated[0x400:0x410]

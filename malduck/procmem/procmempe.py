@@ -75,27 +75,51 @@ class ProcessMemoryPE(ProcessMemoryBinary):
         return pe
 
     def _reload_as_image(self) -> None:
+        # Buffer offset where the image starts. All regions created below
+        # keep offsets in the coordinate system of the underlying buffer,
+        # so address translation stays consistent with the ProcessMemory
+        # object the image was carved from (e.g. Yara offsets matched
+        # on the original dump can be remapped through this view).
+        img_offset = self.v2p(self.imgbase)
+        if img_offset is None:
+            raise ValueError("imgbase out of regions")
         # Load PE data from imgbase offset
         pe = self._pe_direct_load(fast_load=False)
-        # If mmap: close all descriptors or
-        # nullify references if mmap is not owned by current object
-        self.close()
-        # Set memory to the pe.data buffer
-        self.memory = bytearray(pe.data)
+        # If mmap: close all descriptors (or nullify references if mmap
+        # is not owned by current object), copying the contents, so the
+        # image view stays valid after the original dump is closed.
+        self.close(copy=True)
         self.imgbase = pe.optional_header.ImageBase
-        # Reset regions
-        self.regions = [Region(self.imgbase, pe.headers_size, 0, 0, 0, 0)]
+        buf_len = self.length
+        # Reset regions. Offsets are relative to the start of the
+        # underlying buffer (img_offset), not to the start of the image.
+        self.regions = [
+            Region(
+                self.imgbase,
+                min(pe.headers_size, buf_len - img_offset),
+                0,
+                0,
+                0,
+                img_offset,
+            )
+        ]
         # Load image sections
         for section in pe.sections:
             if section.SizeOfRawData > 0:
+                section_offset = img_offset + section.PointerToRawData
+                if section_offset >= buf_len:
+                    # Section points beyond available data (truncated
+                    # or inconsistent metadata): don't map bytes that
+                    # don't exist.
+                    continue
                 self.regions.append(
                     Region(
                         self.imgbase + section.VirtualAddress,
-                        section.SizeOfRawData,
+                        min(section.SizeOfRawData, buf_len - section_offset),
                         0,
                         0,
                         0,
-                        section.PointerToRawData,
+                        section_offset,
                     )
                 )
 

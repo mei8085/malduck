@@ -1,4 +1,4 @@
-from malduck import procmemelf
+from malduck import procmem, procmemelf
 
 
 def test_hello():
@@ -52,3 +52,21 @@ def test_hidden_32_static():
                       b"\x64\x65\x21\x29\x0a"
         assert pelf.readv(0x80ed200, len(hidden_code)) == hidden_code
         assert pelf.imgend == 135200768
+
+
+def test_carved_elf_image_coords():
+    with open("tests/files/hello_static", "rb") as f:
+        elf_data = f.read()
+    # ELF embedded at non-zero offset in a larger dump
+    mem = procmem(b"\xcc" * 0x200 + elf_data, base=0x700000)
+    pelf = procmemelf.from_memory(mem, base=0x700200, image=True)
+    assert pelf.imgbase == 0x400000
+    assert pelf.readv(pelf.imgbase, 4) == b"\x7fELF"
+    # Regions keep offsets in the coordinate system of the underlying dump
+    assert pelf.regions[0].offset == 0x200
+    # Dump offset of the embedded ELF start maps to the image base
+    assert pelf.p2v(0x200) == pelf.imgbase
+    # Hits located before the embedded ELF must not be mapped into the image
+    assert pelf.p2v(0x100) is None
+    # Reads through the image view return the same bytes as the dump buffer
+    assert pelf.readv(pelf.imgbase, 16) == mem.readp(0x200, 16)

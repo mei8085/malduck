@@ -19,13 +19,20 @@ class CuckooProcessMemory(ProcessMemory):
 
         while ptr < self.length:
             hdr = self.readp(ptr, 24)
-            if not hdr:
+            if len(hdr) < 24:
+                # Truncated region header: stop parsing instead of
+                # deriving regions from inconsistent metadata
                 break
 
             addr, size, state, typ, protect = struct.unpack("QIIII", hdr)
             ptr += 24
 
-            self.regions.append(Region(addr, size, state, typ, protect, ptr))
+            if size > self.length - ptr:
+                # Region data is truncated: clamp to the available
+                # contents instead of mapping bytes that don't exist
+                size = self.length - ptr
+            if size:
+                self.regions.append(Region(addr, size, state, typ, protect, ptr))
             ptr += size
         if base is None:
             if self.regions:

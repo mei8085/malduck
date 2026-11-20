@@ -210,7 +210,10 @@ class ProcessMemory:
         :rtype: :class:`ProcessMemory`
         """
         copied = cls(
-            memory.m, base=base or memory.imgbase, regions=memory.regions, **kwargs
+            memory.m,
+            base=base if base is not None else memory.imgbase,
+            regions=memory.regions,
+            **kwargs,
         )
         return copied
 
@@ -336,16 +339,28 @@ class ProcessMemory:
         if addr is None:
             return None
         mapping_length = 0
+        result = None
+        prev_region = None
         for region in self.iter_regions(
             addr=addr, length=length, contiguous=True, trim=True
         ):
+            # Regions must be contiguous in buffer offset space as well.
+            # Otherwise the translated range doesn't correspond to
+            # a contiguous buffer chunk and we'd return an offset
+            # pointing at unrelated bytes.
+            if prev_region is not None and prev_region.end_offset != region.offset:
+                return None
+            if result is None:
+                # Translation must be performed using the first region,
+                # the one that actually contains the starting address
+                result = region.v2p(addr)
+            prev_region = region
             if length is None:
-                return region.v2p(addr)
+                return result
             mapping_length += region.size
             if mapping_length >= length:
-                return region.v2p(addr)
-        else:
-            return None
+                return result
+        return None
 
     def p2v(self, off, length=None):
         """
@@ -362,16 +377,28 @@ class ProcessMemory:
         if off is None:
             return None
         mapping_length = 0
+        result = None
+        prev_region = None
         for region in self.iter_regions(
             offset=off, length=length, contiguous=True, trim=True
         ):
+            # Regions must be contiguous in buffer offset space as well.
+            # Otherwise the translated range doesn't correspond to
+            # a contiguous buffer chunk and we'd return an address
+            # pointing at unrelated bytes.
+            if prev_region is not None and prev_region.end_offset != region.offset:
+                return None
+            if result is None:
+                # Translation must be performed using the first region,
+                # the one that actually contains the starting offset
+                result = region.p2v(off)
+            prev_region = region
             if length is None:
-                return region.p2v(off)
+                return result
             mapping_length += region.size
             if mapping_length >= length:
-                return region.p2v(off)
-        else:
-            return None
+                return result
+        return None
 
     def is_addr(self, addr):
         """

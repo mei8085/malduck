@@ -58,9 +58,21 @@ class ProcessMemoryELF(ProcessMemoryBinary):
 
     def _reload_as_image(self) -> None:
         page_size = 0x1000
+        # Buffer offset where the image starts. All regions created below
+        # keep offsets in the coordinate system of the underlying buffer,
+        # so address translation stays consistent with the ProcessMemory
+        # object the image was carved from.
+        img_offset = self.v2p(self.imgbase)
+        if img_offset is None:
+            raise elftools.elf.elffile.ELFError("imgbase out of regions")
+        # If mmap: close all descriptors (or nullify references if mmap
+        # is not owned by current object), copying the contents, so the
+        # image view stays valid after the original dump is closed.
+        self.close(copy=True)
         # Reset regions
         imgbase = None
         regions = []
+        buf_len = self.length
         # Load image segments
         for segment in self.elf.iter_segments():
             if segment.header["p_type"] == "PT_LOAD":
@@ -77,14 +89,24 @@ class ProcessMemoryELF(ProcessMemoryBinary):
                         - (segment.header["p_vaddr"] + segment.header["p_filesz"])
                         % page_size
                     )
+                region_offset = img_offset + segment.header["p_offset"] - presegment_len
+                if region_offset < 0 or region_offset >= buf_len:
+                    # Segment points beyond available data (truncated
+                    # or inconsistent metadata): don't map bytes that
+                    # don't exist.
+                    continue
+                region_size = min(
+                    segment.header["p_filesz"] + presegment_len + postsegment_len,
+                    buf_len - region_offset,
+                )
                 regions.append(
                     Region(
                         segment.header["p_vaddr"] - presegment_len,
-                        segment.header["p_filesz"] + presegment_len + postsegment_len,
+                        region_size,
                         0,
                         segment.header["p_type"],
                         0,  # TODO: protect flags
-                        segment.header["p_offset"] - presegment_len,
+                        region_offset,
                     )
                 )
         if len(regions) == 0:
