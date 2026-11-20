@@ -9,10 +9,16 @@ from .region import (
     PAGE_EXECUTE_READ,
     PAGE_EXECUTE_READWRITE,
     PAGE_EXECUTE_WRITECOPY,
+    PAGE_GUARD,
+    PAGE_NOACCESS,
+    PAGE_NOCACHE,
     PAGE_READONLY,
     PAGE_READWRITE,
+    PAGE_WRITECOMBINE,
     PAGE_WRITECOPY,
     Region,
+    normalize_regions,
+    page_protect_to_access,
 )
 
 __all__ = [
@@ -30,6 +36,9 @@ __all__ = [
     "IDAProcessMemory",
     "idamem",
     "Region",
+    "normalize_regions",
+    "page_protect_to_access",
+    "PAGE_NOACCESS",
     "PAGE_READONLY",
     "PAGE_READWRITE",
     "PAGE_WRITECOPY",
@@ -37,4 +46,7 @@ __all__ = [
     "PAGE_EXECUTE_READ",
     "PAGE_EXECUTE_READWRITE",
     "PAGE_EXECUTE_WRITECOPY",
+    "PAGE_GUARD",
+    "PAGE_NOCACHE",
+    "PAGE_WRITECOMBINE",
 ]

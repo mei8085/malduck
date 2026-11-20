@@ -6,7 +6,7 @@ import elftools.elf.elffile
 
 from .binmem import ProcessMemoryBinary
 from .procmem import ProcessMemoryBuffer
-from .region import Region
+from .region import Region, normalize_regions
 
 __all__ = ["ProcessMemoryELF", "procmemelf"]
 
@@ -92,7 +92,14 @@ class ProcessMemoryELF(ProcessMemoryBinary):
         if imgbase is None:
             raise elftools.elf.elffile.ELFError("Can't find ELF image base!")
         self.imgbase = imgbase
-        self.regions = regions
+        # Program headers come from an untrusted file: canonicalize the
+        # segment table so overlapping or out-of-bounds PT_LOAD segments
+        # cannot establish conflicting virtual-to-physical mappings.
+        self.regions = normalize_regions(regions, self.length)
+        if not self.regions:
+            raise elftools.elf.elffile.ELFError(
+                "No valid, fully-backed regions in ELF file!"
+            )
 
     @property
     def elf(self) -> elftools.elf.elffile.ELFFile:

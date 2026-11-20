@@ -6,7 +6,7 @@ from ..disasm import disasm
 from ..string.bin import int8, int16, int32, int64, uint8, uint16, uint32, uint64
 from ..string.ops import utf16z
 from ..yara import Yara, YaraString
-from .region import PAGE_EXECUTE_READWRITE, Region
+from .region import PAGE_EXECUTE_READWRITE, Region, normalize_regions
 
 __all__ = ["ProcessMemory", "procmem"]
 
@@ -108,7 +108,10 @@ class ProcessMemory:
         self.imgbase = base
 
         if regions is not None:
-            self.regions = regions
+            # Region tables come from untrusted dumps: canonicalize them so the
+            # rest of the class can rely on sorted, non-overlapping and
+            # fully-backed mappings instead of attacker-controlled fields.
+            self.regions = normalize_regions(regions, self.length)
         else:
             self.regions = [Region(base, self.length, 0, 0, PAGE_EXECUTE_READWRITE, 0)]
 
@@ -266,6 +269,9 @@ class ProcessMemory:
             raise ValueError("Length can't be less than 0")
         # No length, no problem
         if length == 0:
+            return
+        # An empty (or fully rejected) region table maps nothing.
+        if not self.regions:
             return
         # If we don't have starting point provided: first region is the
         # starting point
@@ -803,6 +809,12 @@ class ProcessMemory:
                 if extended is set to True
         """
         if addr is None:
+            if not self.regions:
+                return ruleset.match(
+                    offset_mapper=lambda off, len: None,
+                    extended=extended,
+                    data=self.readp(0),
+                )
             addr = self.regions[0].addr
         if length is None:
             length = self.regions[-1].end - addr

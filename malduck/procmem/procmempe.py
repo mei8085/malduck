@@ -4,7 +4,7 @@ from ..bits import align
 from ..pe import PE
 from .binmem import ProcessMemoryBinary
 from .procmem import ProcessMemoryBuffer
-from .region import Region
+from .region import Region, normalize_regions
 
 __all__ = ["ProcessMemoryPE", "procmempe"]
 
@@ -98,6 +98,10 @@ class ProcessMemoryPE(ProcessMemoryBinary):
                         section.PointerToRawData,
                     )
                 )
+        # Section headers are attacker-controlled too: canonicalize the
+        # resulting table so overlapping/out-of-bounds sections cannot produce
+        # conflicting virtual-to-physical mappings.
+        self.regions = normalize_regions(self.regions, self.length)
 
     def is_valid(self) -> bool:
         if self.readv(self.imgbase, 2) != self.__magic__:
