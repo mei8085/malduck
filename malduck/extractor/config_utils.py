@@ -11,6 +11,11 @@ def is_config_better(base_config: Config, new_config: Config) -> bool:
     """
     Checks whether new config looks more reliable than base.
     Currently just checking the amount of non-empty keys.
+
+    .. deprecated:: 4.1.0
+        Cross-dump configs are now merged with provenance tracking by
+        :mod:`malduck.extractor.config_merger` instead of being replaced by
+        the "better" one. Retained for backwards compatibility of custom code.
     """
     base = [(k, v) for k, v in base_config.items() if v]
     new = [(k, v) for k, v in new_config.items() if v]

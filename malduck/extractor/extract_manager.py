@@ -6,11 +6,11 @@ from typing import Any, Dict, Iterator, List, Optional, Type
 from ..procmem import ProcessMemory, ProcessMemoryELF, ProcessMemoryPE
 from ..procmem.binmem import ProcessMemoryBinary
 from ..yara import Yara, YaraRuleOffsets, YaraRulesetMatch
+from .config_merger import CONFIG_META_KEY, ConfigSource, MergedConfig
 from .config_utils import (
     Config,
     apply_config_part,
     encode_for_json,
-    is_config_better,
     sanitize_config,
 )
 from .extractor import Extractor
@@ -25,6 +25,12 @@ class ExtractManager:
     """
     Multi-dump extraction context. Handles merging configs from different dumps, additional dropped families etc.
 
+    Configurations ripped from different memory dumps are merged with full
+    provenance: equivalent fields are combined, contradictory values keep their
+    sources and are flagged for review, and decoy / sourceless /
+    type-inconsistent observations never silently overwrite an existing value.
+    See :mod:`malduck.extractor.config_merger` for the merge semantics.
+
     :param modules: Object with loaded extractor modules
     :type modules: :class:`ExtractorModules`
     """
@@ -35,7 +41,10 @@ class ExtractManager:
             ProcessMemoryPE,
             ProcessMemoryELF,
         ]
-        self.configs: Dict[str, Config] = {}
+        #: Provenance-preserving merged configuration for each extracted family
+        self.merged_configs: Dict[str, MergedConfig] = {}
+        #: Stack of sources currently being extracted (push_procmem/push_file)
+        self._source_stack: List[ConfigSource] = []
 
     @property
     def rules(self) -> Yara:
@@ -52,6 +61,11 @@ class ExtractManager:
         :rtype: List[Type[:class:`malduck.extractor.Extractor`]]
         """
         return self.modules.extractors
+
+    @property
+    def current_source(self) -> Optional[ConfigSource]:
+        """Source of the dump currently being extracted, if known."""
+        return self._source_stack[-1] if self._source_stack else None
 
     def on_error(self, exc: Exception, extractor: Extractor) -> None:
         """
@@ -91,7 +105,13 @@ class ExtractManager:
             traceback.format_exc(),
         )
 
-    def push_file(self, filepath: str, base: int = 0) -> Optional[str]:
+    def push_file(
+        self,
+        filepath: str,
+        base: int = 0,
+        source: Optional[str] = None,
+        decoy: bool = False,
+    ) -> Optional[str]:
         """
         Pushes file for extraction. Config extractor entrypoint.
 
@@ -99,11 +119,22 @@ class ExtractManager:
         :type filepath: str
         :param base: Memory dump base address
         :type base: int
+        :param source: Optional source label attached to every ripped field.
+            Defaults to the file path, which is also the provenance used when
+            merging configs from subsequent dumps.
+        :type source: str
+        :param decoy: Flag the whole configuration ripped from this dump as a
+            suspected decoy. Decoy observations are retained but never promoted
+            to trusted values.
+        :type decoy: bool
         :return: Detected family if configuration looks better than already stored one
         """
         log.debug("Started extraction of file %s:%x", filepath, base)
+        dump_source = ConfigSource(source or filepath, decoy=decoy)
         with ProcessMemory.from_file(filepath, base=base) as p:
-            return self.push_procmem(p, rip_binaries=True)
+            return self.push_procmem(
+                p, rip_binaries=True, source=dump_source
+            )
 
     def match_procmem(self, p: ProcessMemory) -> YaraRulesetMatch:
         """
@@ -128,35 +159,58 @@ class ExtractManager:
                 )
                 yield carved_bin
 
-    def push_config(self, config: Config) -> bool:
+    def push_config(
+        self,
+        config: Config,
+        source: Optional[ConfigSource] = None,
+        decoy: Optional[bool] = None,
+    ) -> bool:
+        """
+        Merge a complete configuration ripped from one dump into the stored
+        configuration of its family.
+
+        Contrary to a plain replacement, no previously collected value is
+        overwritten: equivalent fields are merged, contradictory values are
+        preserved with their sources and flagged for review, and type
+        inconsistencies / decoys / missing sources are handled by
+        :class:`~malduck.extractor.config_merger.MergedConfig`.
+
+        :param config: Configuration dict (must contain a ``family`` key). It
+            may carry a ``__meta__`` dict with a ``decoy`` flag.
+        :type config: dict
+        :param source: Provenance of the configuration. When ``None``, the
+            current dump source is used; if that is also unknown, the
+            provenance gap is recorded rather than silently accepted.
+        :type source: :class:`~malduck.extractor.config_merger.ConfigSource`
+        :param decoy: Explicit decoy flag taking precedence over ``__meta__``
+        :type decoy: bool, optional
+        :return: True if the family configuration was collected/updated
+        """
         if not config.get("family"):
             return False
 
         family = config["family"]
-        if family in self.configs:
-            if is_config_better(base_config=self.configs[family], new_config=config):
-                self.configs[family] = config
-                log.debug("%s config looks better than previous one", family)
-                return True
-            else:
-                log.debug("%s config doesn't look better than previous one", family)
-                return False
+        source = source if source is not None else self.current_source
+
+        if family in self.merged_configs:
+            log.debug("Merging new %s config from source %s", family, source)
+            self.merged_configs[family].merge(config, source=source, decoy=decoy)
+            return True
 
         if family in self.modules.override_paths:
             # 'citadel' > 'zeus'
             # If 'zeus' appears but we have already 'citadel', we should ignore 'zeus'
             # Otherwise we should get 'citadel' instead of 'zeus'
-            for stored_family in self.configs.keys():
+            for stored_family in list(self.merged_configs.keys()):
                 if stored_family == family:
                     continue
                 score = self.modules.compare_family_overrides(family, stored_family)
                 if score == -1:
-                    del self.configs[stored_family]
-                    self.configs[family] = config
+                    del self.merged_configs[stored_family]
                     log.debug(
                         "%s config looks better (overrides %s)", family, stored_family
                     )
-                    return True
+                    break
                 elif score == 1:
                     log.debug(
                         "%s config doesn't look better than previous one (overridden by %s)",
@@ -166,7 +220,9 @@ class ExtractManager:
                     return False
 
         log.debug("New %s config collected", family)
-        self.configs[family] = config
+        merged = MergedConfig(family)
+        merged.merge(config, source=source, decoy=decoy)
+        self.merged_configs[family] = merged
         return True
 
     def _extract_procmem(self, p: ProcessMemory, matches) -> Optional[str]:
@@ -190,7 +246,11 @@ class ExtractManager:
             return None
 
     def push_procmem(
-        self, p: ProcessMemory, rip_binaries: bool = False
+        self,
+        p: ProcessMemory,
+        rip_binaries: bool = False,
+        source: Optional[ConfigSource] = None,
+        decoy: bool = False,
     ) -> Optional[str]:
         """
         Pushes ProcessMemory object for extraction
@@ -200,26 +260,71 @@ class ExtractManager:
         :param rip_binaries: Look for binaries (PE, ELF) in provided ProcessMemory and try to perform extraction using
             specialized variants (ProcessMemoryPE, ProcessMemoryELF)
         :type rip_binaries: bool (default: False)
+        :param source: Optional source label (e.g. dump path) used as
+            provenance for every field ripped from this object. When omitted
+            and no :meth:`push_file` context is active, ripped fields carry a
+            recorded provenance gap; an anonymous observation that contradicts
+            a sourced one blocks the field pending review instead of resolving
+            the conflict.
+        :type source: str or :class:`~malduck.extractor.config_merger.ConfigSource`, optional
+        :param decoy: Flag configurations ripped from this object as suspected
+            decoys. Decoy values are retained but never silently trusted.
+        :type decoy: bool (default: False)
         :return: Detected family if configuration looks better than already stored one
         """
-        matches = self.match_procmem(p)
-        if not matches:
-            log.debug("No Yara matches.")
-            return None
+        if source is None:
+            dump_source = self.current_source
+            if dump_source is not None and decoy and not dump_source.decoy:
+                dump_source = ConfigSource(dump_source.name, decoy=True)
+        elif isinstance(source, ConfigSource):
+            dump_source = source
+            if decoy and not dump_source.decoy:
+                dump_source = ConfigSource(dump_source.name, decoy=True)
+        else:
+            # Accept plain string labels as well
+            dump_source = ConfigSource(str(source), decoy=decoy)
 
-        binaries = self.carve_procmem(p) if rip_binaries else iter([])
+        if dump_source is not None:
+            self._source_stack.append(dump_source)
+        try:
+            matches = self.match_procmem(p)
+            if not matches:
+                log.debug("No Yara matches.")
+                return None
 
-        family = self._extract_procmem(p, matches)
-        for binary in binaries:
-            family = self._extract_procmem(binary, matches) or family
-        return family
+            binaries = self.carve_procmem(p) if rip_binaries else iter([])
+
+            family = self._extract_procmem(p, matches)
+            for binary in binaries:
+                family = self._extract_procmem(binary, matches) or family
+            return family
+        finally:
+            if dump_source is not None:
+                self._source_stack.pop()
 
     @property
     def config(self) -> List[Config]:
         """
         Extracted configuration (list of configs for each extracted family)
+
+        Returns the trusted view of each merged configuration: fields
+        conflicting between dumps, type-inconsistent fields, decoy-only fields
+        and conflicts involving an unattributed source are omitted. Use
+        :attr:`merged_configs` (or :attr:`merged`) to access them together
+        with their provenance, confidence and review status.
         """
-        return [config for family, config in self.configs.items()]
+        return [
+            merged.trusted_dict() for merged in self.merged_configs.values()
+        ]
+
+    @property
+    def merged(self) -> List[MergedConfig]:
+        """
+        Provenance-preserving merged configurations, one per extracted family.
+
+        :rtype: List[:class:`~malduck.extractor.config_merger.MergedConfig`]
+        """
+        return list(self.merged_configs.values())
 
 
 class ExtractionContext:
@@ -305,6 +410,10 @@ class ExtractionContext:
         and that family overrides stored family - set stored family
         Example: citadel overrides zeus
 
+        Per-config flags can be passed through the reserved ``__meta__`` key
+        (currently ``{"decoy": True}``); they are consumed later by the
+        cross-dump merger and never stored in the config itself.
+
         :param config: Partial config object
         :type config: dict
         :param extractor: Extractor object reference
@@ -317,9 +426,14 @@ class ExtractionContext:
             log.debug("Config is not JSON-encodable (%s): %s", str(e), repr(config))
             raise RuntimeError("Config must be JSON-encodable")
 
+        raw_meta = config.get(CONFIG_META_KEY)
+        meta = raw_meta if isinstance(raw_meta, dict) and raw_meta else None
+        if CONFIG_META_KEY in config:
+            config = {k: v for k, v in config.items() if k != CONFIG_META_KEY}
+
         config = sanitize_config(config)
 
-        if not config:
+        if not config and not meta:
             return
 
         log.debug(
@@ -327,6 +441,24 @@ class ExtractionContext:
             extractor.__class__.__name__,
             sorted(config.keys()),
         )
+
+        if meta:
+            # Merge reserved per-config flags instead of running them through
+            # apply_config_part, which would treat differing dicts as an
+            # illegal override.
+            base_meta = self.collected_config.get(CONFIG_META_KEY, {})
+            merged_meta = dict(base_meta)
+            for flag, flag_value in meta.items():
+                if flag == "decoy":
+                    merged_meta[flag] = bool(merged_meta.get(flag, False)) or bool(
+                        flag_value
+                    )
+                elif flag not in merged_meta:
+                    merged_meta[flag] = flag_value
+            self.collected_config[CONFIG_META_KEY] = merged_meta
+
+        if not config:
+            return
 
         if "family" in config:
             log.debug(

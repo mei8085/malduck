@@ -8,5 +8,6 @@ dist/
 build/
 malduck.egg-info/
 ven*/
+.venv/
 .mypy_cache/
 .DS_Store
