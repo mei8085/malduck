@@ -337,11 +337,21 @@ class Extractor:
         """
         Push extracted procmem object for further analysis
 
+        The payload is recursively analyzed in its own extraction context, so
+        the boundary, encoding and family identifier of each nesting layer are
+        resolved independently. Extraction of a branch is stopped (keeping the
+        provenance information collected so far) when circular nesting,
+        excessive nesting depth, exhausted payload budget or an extraction
+        failure is detected. Configurations of unrelated families found in
+        nested payloads are reported separately instead of being merged into
+        the configuration of the current family.
+
         :param procmem: ProcessMemory object
         :type procmem: :class:`malduck.procmem.ProcessMemory`
-        :param info: Additional info about object
+        :param info: Additional provenance info about the object, recorded in
+            :py:attr:`ExtractManager.payloads` (e.g. offset, length, encoding)
         """
-        return self.parent.push_procmem(procmem, **info)
+        return self.parent.push_nested_procmem(procmem, _extractor=self, **info)
 
     def push_config(self, config):
         """

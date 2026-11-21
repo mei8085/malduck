@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import warnings
@@ -27,15 +28,42 @@ class ExtractManager:
 
     :param modules: Object with loaded extractor modules
     :type modules: :class:`ExtractorModules`
+    :param max_payload_depth: Maximal nesting depth for recursively extracted payloads
+        (nested payloads pushed by extractors). Deeper branches are stopped.
+    :type max_payload_depth: int (default: 8)
+    :param max_payloads: Maximal number of nested payloads extracted from a single
+        pushed file/dump. Further branches are stopped.
+    :type max_payloads: int (default: 256)
+    :param max_payload_bytes: Maximal total size (in bytes) of nested payloads extracted
+        from a single pushed file/dump. Protects against malicious samples declaring
+        unbounded payload counts/sizes. Further branches are stopped.
+    :type max_payload_bytes: int (default: 64 MiB)
     """
 
-    def __init__(self, modules: ExtractorModules) -> None:
+    def __init__(
+        self,
+        modules: ExtractorModules,
+        max_payload_depth: int = 8,
+        max_payloads: int = 256,
+        max_payload_bytes: int = 64 * 1024 * 1024,
+    ) -> None:
         self.modules = modules
         self.binary_classes: List[Type[ProcessMemoryBinary]] = [
             ProcessMemoryPE,
             ProcessMemoryELF,
         ]
         self.configs: Dict[str, Config] = {}
+        #: Limits guarding recursive extraction of nested payloads
+        self.max_payload_depth = max_payload_depth
+        self.max_payloads = max_payloads
+        self.max_payload_bytes = max_payload_bytes
+        #: Provenance trail of nested payloads seen during extraction.
+        #: Each entry describes a single nested payload: its hash, size, nesting
+        #: depth, source family, resolved family, extraction status and optional
+        #: extractor-provided details (e.g. offset, length, encoding).
+        self.payloads: List[Config] = []
+        self._payload_count = 0
+        self._payload_bytes = 0
 
     @property
     def rules(self) -> Yara:
@@ -202,6 +230,9 @@ class ExtractManager:
         :type rip_binaries: bool (default: False)
         :return: Detected family if configuration looks better than already stored one
         """
+        # Reset the nested payload budget for each top-level sample
+        self._payload_count = 0
+        self._payload_bytes = 0
         matches = self.match_procmem(p)
         if not matches:
             log.debug("No Yara matches.")
@@ -225,13 +256,43 @@ class ExtractManager:
 class ExtractionContext:
     """
     Single-dump extraction context (single family)
+
+    Contexts form a tree that mirrors the nesting structure of extracted
+    payloads: nested payloads pushed by extractors are analyzed in child
+    contexts, so the payload boundary, encoding and family identifier of each
+    layer are resolved independently. Configurations produced by a child layer
+    are merged back into the parent only when they belong to the same (or an
+    overriding) family - configurations of unrelated families are kept isolated
+    and reported separately.
     """
 
-    def __init__(self, parent: ExtractManager) -> None:
+    def __init__(
+        self,
+        parent: ExtractManager,
+        parent_context: Optional["ExtractionContext"] = None,
+        isolated: bool = False,
+    ) -> None:
         #: Collected configuration so far (especially useful for "final" extractors)
         self.collected_config: Config = {}
-        self.globals: Dict[str, Any] = {}
         self.parent = parent  #: Bound ExtractManager instance
+        #: Context of the layer this payload was extracted from (None for top-level)
+        self.parent_context = parent_context
+        #: Hash of the buffer handled by this context (set on first push)
+        self.payload_hash: Optional[str] = None
+        #: Configurations of nested payloads, absorbed once extraction of
+        #: this layer finishes and the family of this layer is known
+        self._pending_child_configs: List[Any] = []
+        if parent_context is None:
+            self.globals: Dict[str, Any] = {}
+            #: Nesting depth of the payload handled by this context
+            self.depth = 0
+        else:
+            # Nested layers share the globals container with their parent layer
+            # (backwards-compatible scratch space for extractors). Contexts
+            # isolated because of a family mismatch get a fresh container, so
+            # unrelated families can't leak state into each other.
+            self.globals = {} if isolated else parent_context.globals
+            self.depth = parent_context.depth + (0 if isolated else 1)
 
     @property
     def family(self) -> Optional[str]:
@@ -259,21 +320,86 @@ class ExtractionContext:
         """
         Pushes ProcessMemory object for extraction
 
+        If the buffer matches structures of multiple unrelated families, each
+        family is handled in an isolated context so that configuration
+        semantics of different families are not mixed together.
+
         :param p: ProcessMemory object
         :type p: :class:`malduck.procmem.ProcessMemory`
         :param _matches: YaraRulesetMatch object (used internally)
         :type _matches: :class:`malduck.yara.YaraRulesetMatch`
         """
         matches = _matches or p.yarav(self.parent.rules, extended=True)
+        if self.payload_hash is None:
+            self.payload_hash = hashlib.sha256(p.readp(0)).hexdigest()
+
+        # Group matching extractor classes by family
+        family_groups: Dict[Optional[str], List[Type[Extractor]]] = {}
+        for ext_class in self.parent.extractors:
+            if type(ext_class.yara_rules) is str:
+                raise TypeError(
+                    f'"{ext_class.__name__}.yara_rules" cannot be a string, convert it into a list of strings'
+                )
+            if any(rule in matches for rule in ext_class.yara_rules):
+                family_groups.setdefault(ext_class.family, []).append(ext_class)
+
+        if not family_groups:
+            log.warning("YARA rules didn't trigger any extractor! Is there a typo?")
+            return
+
+        current_family = self.family
+        matched_families = [family for family in family_groups if family is not None]
+        if current_family is None and len(matched_families) > 1:
+            # Fresh context and buffer matches structures of multiple families:
+            # isolate each family in its own context
+            foreign_families = matched_families
+        elif current_family is not None:
+            # Context already identified the family: isolate structures of
+            # unrelated families mixed into the same buffer
+            foreign_families = [
+                family
+                for family in matched_families
+                if family != current_family
+                and not self.parent.modules.compare_family_overrides(
+                    family, current_family
+                )
+            ]
+        else:
+            foreign_families = []
+
+        foreign_configs: List[Config] = []
+        for family in foreign_families:
+            group = family_groups.pop(family)
+            isolated = ExtractionContext(
+                self.parent, parent_context=self, isolated=True
+            )
+            isolated.payload_hash = self.payload_hash
+            isolated._run_extractors(p, matches, group)
+            isolated._absorb_pending_child_configs()
+            foreign_configs.append(isolated.collected_config)
+
+        self._run_extractors(
+            p, matches, [ext for group in family_groups.values() for ext in group]
+        )
+
+        for config in foreign_configs:
+            self._absorb_child_config(config)
+
+        # Absorb configurations of nested payloads pushed by extractor methods.
+        # This is deferred until the family of the current layer is known, so
+        # that unrelated families can be told apart and kept isolated.
+        self._absorb_pending_child_configs()
+
+    def _run_extractors(
+        self,
+        p: ProcessMemory,
+        matches: YaraRulesetMatch,
+        extractor_classes: List[Type[Extractor]],
+    ) -> None:
         used_matches = set()  # Which yara rules had a matching extractor
         # For each extractor...
-        for ext_class in self.parent.extractors:
+        for ext_class in extractor_classes:
             extractor = ext_class(self)
-
-            if type(extractor.yara_rules) is str:
-                raise TypeError(
-                    f'"{extractor.__class__.__name__}.yara_rules" cannot be a string, convert it into a list of strings'
-                )
 
             # For each rule identifier in extractor.yara_rules...
             for rule in extractor.yara_rules:
@@ -294,10 +420,143 @@ class ExtractionContext:
                         self.parent.on_error(exc, extractor)
 
         log.info("The following matches were used: %s", list(used_matches))
-        if not used_matches:
-            log.warning("YARA rules didn't trigger any extractor! Is there a typo?")
 
-    def push_config(self, config: Config, extractor: Extractor) -> None:
+    def push_nested_procmem(
+        self, p: ProcessMemory, _extractor: Optional[Extractor] = None, **info
+    ) -> None:
+        """
+        Pushes nested payload extracted from the currently analyzed buffer
+        for recursive extraction (used internally by
+        :py:meth:`Extractor.push_procmem`).
+
+        The payload is analyzed in a fresh child context, so its boundary,
+        encoding and family identifier are resolved independently from the
+        current layer. Extraction of the current branch is stopped (keeping
+        the provenance information collected so far) when:
+
+        * the same payload was already seen on this branch (circular nesting),
+        * the nesting depth exceeds ``ExtractManager.max_payload_depth``,
+        * the payload budget is exhausted (``ExtractManager.max_payloads`` /
+          ``ExtractManager.max_payload_bytes``), which protects against
+          malicious samples declaring unbounded payload counts/sizes,
+        * the payload can't be analyzed (e.g. truncated or undecodable data
+          making the extraction fail).
+
+        :param p: Nested payload as a ProcessMemory object
+        :type p: :class:`malduck.procmem.ProcessMemory`
+        :param _extractor: Extractor instance pushing the payload (used internally)
+        :param info: Additional provenance info about the payload
+            (e.g. offset, length, encoding)
+        """
+        manager = self.parent
+        payload_hash = hashlib.sha256(p.readp(0)).hexdigest()
+        # The family of the layer the payload was carved from. At this point
+        # the collected config may not be resolved yet, so prefer the family
+        # declared by the extractor pushing the payload.
+        source_family: Optional[str]
+        if _extractor is not None and _extractor.family:
+            source_family = _extractor.family
+        else:
+            source_family = self.family
+        record: Config = {
+            "sha256": payload_hash,
+            "depth": self.depth + 1,
+            "size": p.length,
+            "source_family": source_family,
+            "family": None,
+            "status": "ok",
+        }
+        for key, value in info.items():
+            if key not in record:
+                try:
+                    record[key] = encode_for_json(value)
+                except Exception:
+                    record[key] = repr(value)
+        # Provenance is recorded even if the branch has to be stopped
+        manager.payloads.append(record)
+
+        # Guard against excessive nesting depth
+        if self.depth + 1 > manager.max_payload_depth:
+            record["status"] = "max-depth"
+            log.debug("Nested payload skipped: maximal nesting depth exceeded")
+            return
+        # Guard against circular nesting (payload already seen on this branch)
+        ctx: Optional[ExtractionContext] = self
+        while ctx is not None:
+            if ctx.payload_hash == payload_hash:
+                record["status"] = "circular"
+                log.debug("Nested payload skipped: circular nesting detected")
+                return
+            ctx = ctx.parent_context
+        # Guard against unbounded resource consumption
+        if (
+            manager._payload_count + 1 > manager.max_payloads
+            or manager._payload_bytes + p.length > manager.max_payload_bytes
+        ):
+            record["status"] = "budget-exceeded"
+            log.debug("Nested payload skipped: payload budget exceeded")
+            return
+        manager._payload_count += 1
+        manager._payload_bytes += p.length
+
+        child = ExtractionContext(manager, parent_context=self)
+        child.payload_hash = payload_hash
+        try:
+            child.push_procmem(p)
+        except Exception as exc:
+            # Stop the branch but keep whatever was collected so far
+            record["status"] = "error"
+            if _extractor is not None:
+                self.on_extractor_error(exc, _extractor, "push_procmem")
+            else:
+                log.warning("Nested payload extraction failed: %s", exc)
+        config = child.collected_config
+        record["family"] = config.get("family")
+        # Defer absorption until this layer finished extraction and its
+        # family is known (see push_procmem)
+        self._pending_child_configs.append((config, _extractor))
+
+    def _absorb_pending_child_configs(self) -> None:
+        for child_config, child_extractor in self._pending_child_configs:
+            self._absorb_child_config(child_config, child_extractor)
+        self._pending_child_configs = []
+
+    def _absorb_child_config(
+        self, config: Config, extractor: Optional[Extractor] = None
+    ) -> None:
+        """
+        Merges configuration extracted from a child layer back into this
+        context. Configurations of unrelated families are not merged - they
+        are reported to ExtractManager as separate configs, so structures of
+        other families are not misattributed to the current family.
+        """
+        if not config:
+            return
+        child_family = config.get("family")
+        current_family = self.collected_config.get("family")
+        if (
+            child_family
+            and current_family
+            and child_family != current_family
+            and not self.parent.modules.compare_family_overrides(
+                child_family, current_family
+            )
+        ):
+            log.debug(
+                "Keeping %s config isolated from %s (unrelated families)",
+                child_family,
+                current_family,
+            )
+            self.parent.push_config(config)
+            return
+        try:
+            self.push_config(config, extractor)
+        except RuntimeError as exc:
+            log.warning("Dropping incompatible nested config part (%s)", exc)
+
+    def push_config(
+        self, config: Config, extractor: Optional[Extractor] = None
+    ) -> None:
         """
         Pushes new partial config
 
@@ -307,9 +566,12 @@ class ExtractionContext:
 
         :param config: Partial config object
         :type config: dict
-        :param extractor: Extractor object reference
+        :param extractor: Extractor object reference (optional)
         :type extractor: :class:`malduck.extractor.Extractor`
         """
+        extractor_name = (
+            extractor.__class__.__name__ if extractor is not None else "nested layer"
+        )
         config = encode_for_json(config)
         try:
             json.dumps(config)
@@ -324,14 +586,12 @@ class ExtractionContext:
 
         log.debug(
             "%s found the following config parts: %s",
-            extractor.__class__.__name__,
+            extractor_name,
             sorted(config.keys()),
         )
 
         if "family" in config:
-            log.debug(
-                "%s tells it's %s", extractor.__class__.__name__, config["family"]
-            )
+            log.debug("%s tells it's %s", extractor_name, config["family"])
             if (
                 "family" in self.collected_config
                 and self.collected_config["family"] != config["family"]
