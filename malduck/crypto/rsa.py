@@ -127,8 +127,12 @@ class RSA:
             return None
 
         obj = BlobTypes[header.bType]()
-        obj.parse(buf)
-        return obj.export_key()
+        try:
+            obj.parse(buf)
+            return obj.export_key()
+        except (ValueError, IndexError, TypeError, KeyError):
+            # Attacker-controlled blob fields must not surface as exceptions.
+            return None
 
     @staticmethod
     def export_key(

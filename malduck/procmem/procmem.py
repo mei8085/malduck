@@ -2,6 +2,18 @@ import mmap
 import re
 from typing import BinaryIO, List, Optional, Union, cast
 
+from ..crypto.keyblob import (
+    BLOBHEADER_SIZE,
+    MAX_KEY_BLOB_SIZE,
+    RSAPUBKEY_SIZE,
+    KeyImportError,
+    KeyImportResult,
+    KeyImportStatus,
+    material_from_plan,
+    merge_key_results,
+    plan_key_blob,
+    scan_key_blobs,
+)
 from ..disasm import disasm
 from ..string.bin import int8, int16, int32, int64, uint8, uint16, uint32, uint64
 from ..string.ops import utf16z
@@ -756,6 +768,292 @@ class ProcessMemory:
             extract_manager = ExtractManager(modules)
         extract_manager.push_procmem(self)
         return extract_manager.config
+
+    def import_key(
+        self,
+        addr=None,
+        offset=None,
+        *,
+        expected_family=None,
+        expected_version=None,
+        max_size=None,
+    ):
+        r"""
+        Strictly imports a Windows key blob located at a virtual address or
+        buffer offset.
+
+        Memory dumps are attacker-controlled, so this method refuses to treat
+        region descriptors as a trusted mapping. Before the blob is parsed:
+
+        * the start address must be covered by exactly **one** region
+          (overlapping or duplicate descriptors yield
+          :attr:`KeyImportStatus.REGION_OVERLAP`),
+        * the *entire* declared structure must be contained in that same
+          region and backed by bytes that exist in the buffer, otherwise the
+          import fails with :attr:`KeyImportStatus.TRUNCATED` /
+          :attr:`KeyImportStatus.REGION_MISMATCH` / region overlap,
+        * the declared length and the ``BLOBHEADER`` version are validated by
+          :func:`malduck.crypto.keyblob.plan_key_blob`, giving
+          :attr:`KeyImportStatus.LENGTH_OVERFLOW`,
+          :attr:`KeyImportStatus.LENGTH_MISMATCH` or
+          :attr:`KeyImportStatus.BAD_VERSION` as appropriate.
+
+        On success the returned :class:`KeyImportResult` carries a
+        :class:`~malduck.crypto.keyblob.KeyMaterial` bound to the origin
+        region, its virtual address and its algorithm family. Use that object
+        (not the raw bytes) for later configuration decryption so that the
+        cipher implementation always matches the key's family.
+
+        :param addr: Virtual address of the key structure
+        :param offset: Buffer (physical) offset of the key structure; mutually
+            exclusive with ``addr``
+        :param expected_family: Optional :class:`~malduck.crypto.keyblob.KeyFamily`
+            the key must belong to
+        :param expected_version: Optional exact ``BLOBHEADER.bVersion``
+        :param max_size: Upper bound for the declared structure size
+        :rtype: :class:`malduck.crypto.keyblob.KeyImportResult`
+        """
+        if max_size is None:
+            max_size = MAX_KEY_BLOB_SIZE
+        if (addr is None) == (offset is None):
+            return KeyImportResult.failure(
+                KeyImportStatus.REGION_MISMATCH,
+                "Exactly one of 'addr' or 'offset' must be provided",
+            )
+
+        if addr is not None:
+            candidates = [r for r in self.regions if r.contains_addr(addr)]
+            if not candidates:
+                return KeyImportResult.failure(
+                    KeyImportStatus.REGION_MISMATCH,
+                    "Address 0x%x is not mapped by any region" % addr,
+                )
+            if len(candidates) > 1:
+                return KeyImportResult.failure(
+                    KeyImportStatus.REGION_OVERLAP,
+                    "Address 0x%x is mapped by %d overlapping regions"
+                    % (addr, len(candidates)),
+                )
+            region = candidates[0]
+            start_addr = addr
+            start_offset = region.v2p(addr)
+            # Virtual bytes available from the start of the structure up to the
+            # region end, additionally clipped to what is physically backed.
+            avail = min(region.end - addr, region.end_offset - start_offset)
+            avail = min(avail, max(self.length - start_offset, 0))
+        else:
+            candidates = [r for r in self.regions if r.contains_offset(offset)]
+            if not candidates:
+                return KeyImportResult.failure(
+                    KeyImportStatus.REGION_MISMATCH,
+                    "Offset 0x%x is not mapped by any region" % offset,
+                )
+            if len(candidates) > 1:
+                return KeyImportResult.failure(
+                    KeyImportStatus.REGION_OVERLAP,
+                    "Offset 0x%x is mapped by %d overlapping regions"
+                    % (offset, len(candidates)),
+                )
+            region = candidates[0]
+            start_addr = region.p2v(offset)
+            start_offset = offset
+            avail = min(region.end_offset - offset, region.end - start_addr)
+            avail = min(avail, max(self.length - offset, 0))
+
+        # Read only the prefix needed to learn the declared size (header plus
+        # cbKey / RSAPUBKEY). An attacker-controlled length can never make us
+        # read the declared amount up front.
+        prefix_len = min(avail, BLOBHEADER_SIZE + RSAPUBKEY_SIZE)
+        if prefix_len < BLOBHEADER_SIZE:
+            return KeyImportResult.failure(
+                KeyImportStatus.REGION_MISMATCH,
+                "Region at 0x%x does not back a full BLOBHEADER" % (start_addr,),
+                region=region,
+                addr=start_addr,
+                offset=start_offset,
+            )
+
+        header = self.readp(start_offset, prefix_len)
+        if len(header) != prefix_len:
+            return KeyImportResult.failure(
+                KeyImportStatus.TRUNCATED,
+                "BLOBHEADER truncated by end of buffer",
+                region=region,
+                addr=start_addr,
+                offset=start_offset,
+            )
+
+        try:
+            # A memory region is a container, so bytes following the declared
+            # structure are expected. The constraint is that the structure
+            # must be fully contained in this region and backed by the buffer.
+            plan = plan_key_blob(
+                header,
+                avail,
+                allow_trailing=True,
+                expected_family=expected_family,
+                expected_version=expected_version,
+                max_size=max_size,
+            )
+        except KeyImportError as exc:
+            return KeyImportResult.failure(
+                exc.status,
+                exc.detail,
+                region=region,
+                addr=start_addr,
+                offset=start_offset,
+                size=exc.size,
+            )
+
+        # The whole structure must stay inside the origin region. This is
+        # checked first so a structure bleeding past the region reports
+        # TRUNCATED rather than being reported as an overlap with whatever
+        # happens to follow the region in the dump.
+        end_addr = start_addr + plan.expected_size
+        if (
+            end_addr > region.end
+            or start_offset + plan.expected_size > region.end_offset
+        ):
+            return KeyImportResult.failure(
+                KeyImportStatus.TRUNCATED,
+                "Key structure crosses the end of region at 0x%x" % region.addr,
+                region=region,
+                addr=start_addr,
+                offset=start_offset,
+                size=plan.expected_size,
+            )
+        if start_offset + plan.expected_size > self.length:
+            return KeyImportResult.failure(
+                KeyImportStatus.TRUNCATED,
+                "Key structure crosses the end of the backing buffer",
+                region=region,
+                addr=start_addr,
+                offset=start_offset,
+                size=plan.expected_size,
+            )
+
+        # A second region covering any part of the accepted range makes the
+        # bytes ambiguous even if its own descriptor is otherwise well-formed.
+        overlapping = [
+            r
+            for r in self.regions
+            if r is not region and r.intersects_range(start_addr, plan.expected_size)
+        ]
+        if overlapping:
+            return KeyImportResult.failure(
+                KeyImportStatus.REGION_OVERLAP,
+                "Key structure 0x%x-0x%x intersects %d other region(s)"
+                % (start_addr, end_addr, len(overlapping)),
+                region=region,
+                addr=start_addr,
+                offset=start_offset,
+                size=plan.expected_size,
+            )
+
+        blob = self.readp(start_offset, plan.expected_size)
+        return material_from_plan(
+            plan, blob, region=region, addr=start_addr, offset=start_offset
+        )
+
+    def scan_keys(
+        self,
+        addr=None,
+        length=None,
+        *,
+        expected_family=None,
+        expected_version=None,
+        max_size=None,
+    ):
+        r"""
+        Scans a whole dump (or a single memory region) for importable keys.
+
+        The scan never reads through region borders: every candidate must be
+        wholly contained in one region and, like :meth:`import_key`, a
+        candidate whose range overlaps another region is rejected. If multiple
+        *distinct* keys are found the result is
+        :attr:`KeyImportStatus.AMBIGUOUS` with all competitors exposed through
+        :attr:`KeyImportResult.candidates` - the method never picks one.
+
+        Ranges whose bytes are ambiguous (overlapping region descriptors) make
+        the scan fail closed with :attr:`KeyImportStatus.REGION_OVERLAP`: no
+        key recovered from a partially ambiguous dump can be trusted. When the
+        scan range is unambiguous and no key is found, the most trust-relevant
+        failure reason (truncation, overflowing length, ...) is reported rather
+        than an empty result.
+
+        :param addr: Virtual address of the region to scan (optional; defaults
+            to the whole dump)
+        :param length: Number of bytes to scan (optional)
+        :param expected_family: Optional required key family
+        :param expected_version: Optional exact ``BLOBHEADER.bVersion``
+        :param max_size: Upper bound for a declared structure size
+        :rtype: :class:`malduck.crypto.keyblob.KeyImportResult`
+        """
+        if max_size is None:
+            max_size = MAX_KEY_BLOB_SIZE
+
+        if addr is None:
+            if not self.regions:
+                return KeyImportResult.failure(
+                    KeyImportStatus.REGION_MISMATCH,
+                    "No memory regions to scan",
+                )
+            start = self.regions[0].addr
+            stop = self.regions[-1].end
+        else:
+            region = self.addr_region(addr)
+            if region is None:
+                return KeyImportResult.failure(
+                    KeyImportStatus.REGION_MISMATCH,
+                    "Address 0x%x is not mapped by any region" % addr,
+                )
+            start = addr
+            stop = region.end
+        if length is not None:
+            stop = min(stop, start + length)
+        stop = max(stop, start)
+
+        results = []
+        # Scan per region so candidate structures can never span a gap or a
+        # region border. Regions whose virtual range intersects another one are
+        # skipped: their bytes are ambiguous.
+        for region in self.regions:
+            current = max(region.addr, start)
+            run_end = min(region.end, stop)
+            if run_end <= current:
+                continue
+            if any(
+                other is not region
+                and other.intersects_range(current, run_end - current)
+                for other in self.regions
+            ):
+                results.append(
+                    KeyImportResult.failure(
+                        KeyImportStatus.REGION_OVERLAP,
+                        "Range 0x%x-0x%x intersects multiple regions"
+                        % (current, run_end),
+                        region=region,
+                        addr=current,
+                    )
+                )
+                continue
+            phys = region.v2p(current)
+            avail = min(run_end - current, self.length - phys)
+            if avail > 0:
+                data = self.readp(phys, avail)
+                results.append(
+                    scan_key_blobs(
+                        data,
+                        available=avail,
+                        expected_family=expected_family,
+                        expected_version=expected_version,
+                        max_size=max_size,
+                        region=region,
+                        addr_base=current,
+                    )
+                )
+
+        return merge_key_results(results)
 
     def yarap(self, ruleset, offset=None, length=None, extended=False):
         """

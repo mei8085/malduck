@@ -246,3 +246,46 @@ BLOB struct
 
 .. autoclass:: malduck.crypto.rsa.PrivateKeyBlob
     :members:
+
+Key material recovered from process memory dumps
+------------------------------------------------
+
+Key blobs carved out of a Windows process memory dump are attacker-controlled
+input. ``ProcessMemory.import_key()`` and ``ProcessMemory.scan_keys()`` only
+accept a key when its region address, its declared length and its structure
+version all validate, and they bind accepted keys to the origin region and
+algorithm family. Failures are reported as distinct
+:class:`~malduck.crypto.keyblob.KeyImportStatus` values (overlapping regions,
+truncated structures, overflowing lengths, ambiguous competing keys, ...) so a
+caller cannot mistake one failure mode for another and ``if result:`` fails
+closed.
+
+.. code-block:: python
+
+    from malduck import procmem
+
+    with procmem.from_file("dump.bin", regions=regions) as p:
+        result = p.import_key(0x41410000)
+        if result:
+            # KeyMaterial carries its region/address provenance and family.
+            plaintext = result.material.decrypt(ciphertext, iv=iv)
+        else:
+            print("key import failed:", result.status)
+
+.. autoclass:: malduck.crypto.keyblob.KeyFamily
+    :members:
+
+.. autoclass:: malduck.crypto.keyblob.KeyImportStatus
+    :members:
+
+.. autoclass:: malduck.crypto.keyblob.KeyImportResult
+    :members:
+
+.. autoclass:: malduck.crypto.keyblob.KeyMaterial
+    :members:
+
+.. autofunction:: malduck.crypto.keyblob.parse_key_blob
+
+.. autofunction:: malduck.crypto.keyblob.scan_key_blobs
+
+.. autofunction:: malduck.crypto.keyblob.plan_key_blob

@@ -51,7 +51,12 @@ class PlaintextKeyBlob(BaseBlob):
         :rtype: Tuple[str, bytes]
         """
         if self.key is not None:
-            return self.types[len(self.key)], self.key
+            algorithm = self.types.get(len(self.key))
+            if algorithm is None:
+                # Attacker-controlled key size: report "no key" instead of
+                # raising KeyError on a length that is not a valid AES key.
+                return None
+            return algorithm, self.key
 
         return None
 
